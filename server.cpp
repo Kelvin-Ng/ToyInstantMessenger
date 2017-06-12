@@ -48,7 +48,7 @@ void handle_accpet(int epollfd, int listenfd) {
     add_event(epollfd, clientfd, EPOLLIN);
 }
 
-void handle_register(int epollfd, int clientfd, UsernameFd* username_fd, FdUsername* fd_username, Buffer* buf, FdBuffer* fd_buffer_out) {
+void handle_register(int epollfd, int clientfd, UsernameFd* username_fd, FdUsername* fd_username, Buffer* buf, FdBlockBuffer* fd_buffer_out) {
     std::string username = buf->get_string();
 
     if (username.size() > 0) {
@@ -56,7 +56,7 @@ void handle_register(int epollfd, int clientfd, UsernameFd* username_fd, FdUsern
         (*fd_username)[clientfd] = username;
 
         size_t req_len = sizeof(size_t) + sizeof(int);
-        Buffer* buf_out = &fd_buffer_out->emplace(clientfd, req_len).first->second;
+        BlockBuffer* buf_out = &fd_buffer_out->emplace(clientfd, -1).first->second;
         buf_out->write(req_len);
         buf_out->write(REQ_SC_REGISTER_ACK);
         modify_event(epollfd, clientfd, EPOLLIN | EPOLLOUT);
@@ -68,7 +68,7 @@ void handle_register(int epollfd, int clientfd, UsernameFd* username_fd, FdUsern
     }
 }
 
-void handle_msg_send(int epollfd, int senderfd, const UsernameFd& username_fd, const FdUsername& fd_username, Buffer* buf, FdBuffer* fd_buffer_out) {
+void handle_msg_send(int epollfd, int senderfd, const UsernameFd& username_fd, const FdUsername& fd_username, Buffer* buf, FdBlockBuffer* fd_buffer_out) {
     // TODO: reduce copying, probably need string_view?
     const std::string& sender = fd_username.find(senderfd)->second;
     size_t sender_size = sender.size();
@@ -77,20 +77,19 @@ void handle_msg_send(int epollfd, int senderfd, const UsernameFd& username_fd, c
     size_t msg_size = msg.size();
     int recverfd = username_fd.find(recver)->second; // TODO: handle non-existing receiver
 
-    size_t req_size = sender_size + msg_size + 3 * sizeof(size_t) + sizeof(int);
-    Buffer* buf_out;
+    size_t req_len = sender_size + msg_size + 3 * sizeof(size_t) + sizeof(int);
+    BlockBuffer* buf_out;
     bool has_remaining;
 
     auto it = fd_buffer_out->find(recverfd);
     if (it == fd_buffer_out->end()) {
-        buf_out = &fd_buffer_out->emplace(recverfd, req_size).first->second;
+        buf_out = &fd_buffer_out->emplace(recverfd, -1).first->second;
         has_remaining = false;
     } else {
         buf_out = &it->second;
-        has_remaining = buf_out->remaining();
-        buf_out->enlarge(req_size);
+        has_remaining = !buf_out->empty();
     }
-    buf_out->write(req_size);
+    buf_out->write(req_len);
     buf_out->write(REQ_SC_NEW_MSG);
     buf_out->write(sender);
     buf_out->write(msg);
@@ -101,8 +100,41 @@ void handle_msg_send(int epollfd, int senderfd, const UsernameFd& username_fd, c
     }
 }
 
+// TODO: need speicial treatments on sending files. Currently using a naive implementation
+void handle_file_send(int epollfd, int senderfd, const UsernameFd& username_fd, const FdUsername& fd_username, Buffer* buf, FdBlockBuffer* fd_buffer_out) {
+    // TODO: reduce copying, probably need string_view?
+    const std::string& sender = fd_username.find(senderfd)->second;
+    size_t sender_size = sender.size();
+    std::string recver = buf->get_string();
+    std::string msg = buf->get_string();
+    size_t msg_size = msg.size();
+    int recverfd = username_fd.find(recver)->second; // TODO: handle non-existing receiver
+
+    size_t req_len = sender_size + msg_size + 3 * sizeof(size_t) + sizeof(int);
+    BlockBuffer* buf_out;
+    bool has_remaining;
+
+    auto it = fd_buffer_out->find(recverfd);
+    if (it == fd_buffer_out->end()) {
+        buf_out = &fd_buffer_out->emplace(recverfd, -1).first->second;
+        has_remaining = false;
+    } else {
+        buf_out = &it->second;
+        has_remaining = !buf_out->empty();
+    }
+    buf_out->write(req_len);
+    buf_out->write(REQ_SC_NEW_FILE);
+    buf_out->write(sender);
+    buf_out->write(msg);
+
+    if (!has_remaining) {
+        // TODO: try writing before polling
+        modify_event(epollfd, recverfd, EPOLLIN | EPOLLOUT);
+    }
+}
+
 // TODO: Should I put all requests into one single buffer?
-void handle_read(int epollfd, int clientfd, FdBuffer* fd_buffer, UsernameFd* username_fd, FdUsername* fd_username, FdBuffer* fd_buffer_out) {
+void handle_read(int epollfd, int clientfd, FdBuffer* fd_buffer, UsernameFd* username_fd, FdUsername* fd_username, FdBlockBuffer* fd_buffer_out) {
     // Get the corresponding buffer
     auto it = fd_buffer->find(clientfd);
     // If the buffer does not exist, create one
@@ -124,23 +156,26 @@ void handle_read(int epollfd, int clientfd, FdBuffer* fd_buffer, UsernameFd* use
             case REQ_CS_SEND_MSG:
                 handle_msg_send(epollfd, clientfd, *username_fd, *fd_username, buf, fd_buffer_out);
                 break;
+            case REQ_CS_SEND_FILE:
+                handle_file_send(epollfd, clientfd, *username_fd, *fd_username, buf, fd_buffer_out);
+                break;
         }
 
         fd_buffer->erase(it);
     }
 }
 
-void handle_write(int epollfd, int recverfd, FdBuffer* fd_buffer_out) {
-    Buffer* buf_out = &fd_buffer_out->find(recverfd)->second;
+void handle_write(int epollfd, int recverfd, FdBlockBuffer* fd_buffer_out) {
+    BlockBuffer* buf_out = &fd_buffer_out->find(recverfd)->second;
 
     if (buf_out->output_to_fd(recverfd) < 0) {
         return;
     }
  
     // TODO: If we use edge trigger, we can avoid modifying the event frequently
-    if (!buf_out->remaining()) {
+    if (buf_out->empty()) {
         modify_event(epollfd, recverfd, EPOLLIN);
-        fd_buffer_out->erase(recverfd);
+        //fd_buffer_out->erase(recverfd);
     }
 }
 
@@ -160,7 +195,7 @@ int main(int argc, char** argv) {
     UsernameFd username_fd;
     FdUsername fd_username;
     FdBuffer fd_buffer;
-    FdBuffer fd_buffer_out;
+    FdBlockBuffer fd_buffer_out;
 
     for (;;) {
         int num = epoll_wait(epollfd, events, EPOLLEVENTS, -1);

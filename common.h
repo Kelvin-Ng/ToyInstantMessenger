@@ -5,11 +5,15 @@
 #include <vector>
 #include <unordered_map>
 #include <cassert>
+#include <queue>
+#include <memory>
 
-#define REQ_CS_REGISTER        1
-#define REQ_CS_SEND_MSG        2
-#define REQ_SC_NEW_MSG         3
-#define REQ_SC_REGISTER_ACK    4
+#define REQ_CS_REGISTER         1
+#define REQ_CS_SEND_MSG         2
+#define REQ_SC_NEW_MSG          3
+#define REQ_SC_REGISTER_ACK     4
+#define REQ_CS_SEND_FILE        5
+#define REQ_SC_NEW_FILE         6
 
 void add_event(int epollfd, int fd, int events);
 void modify_event(int epollfd, int fd, int events);
@@ -115,6 +119,10 @@ class Buffer {
         return wpos_ - rpos_;
     }
 
+    inline bool empty() const {
+        return wpos_ == rpos_;
+    }
+
     inline ssize_t input_from_fd(int fd) {
         ssize_t len = ::read(fd, get_wptr(), capacity() - wpos_);
         if (len > 0) {
@@ -133,13 +141,119 @@ class Buffer {
     }
 
  private:
-    std::vector<unsigned char> buf_;
+    std::vector<char> buf_;
+    size_t wpos_, rpos_;
+};
+
+class BlockBuffer {
+ public:
+    BlockBuffer() : rpos_(0) {
+        block_size_ = sysconf(_SC_PAGESIZE);
+        wpos_ = block_size_;
+    }
+
+    BlockBuffer(ssize_t block_size) : rpos_(0) {
+        if (block_size == -1) {
+            block_size_ = sysconf(_SC_PAGESIZE);
+        } else {
+            block_size_ = block_size;
+        }
+        wpos_ = block_size_;
+    }
+
+    void write(const char* write_start, const char* write_end) {
+        //// TODO: Probably an optimization for branch prediction
+        //if (write_start >= write_end) {
+        //    return;
+        //}
+        while (write_start < write_end) {
+            if (wpos_ == block_size_) {
+                if (free_list_.empty()) {
+                    buf_.emplace(new char[block_size_]);
+                } else {
+                    buf_.push(std::move(free_list_.back()));
+                    free_list_.pop_back();
+                }
+                wpos_ = 0;
+            }
+
+            size_t to_write = std::min((size_t)(write_end - write_start), block_size_ - wpos_);
+            std::copy(write_start, write_start + to_write, buf_.back().get() + wpos_);
+            write_start += to_write;
+            wpos_ += to_write;
+        }
+    }
+
+    template <typename T>
+    inline void write(const T& ptr) {
+        write((const char*)&ptr, (const char*)&ptr + sizeof(T));
+    }
+
+    void write(const std::string& str) {
+        size_t size = str.size();
+        write(size);
+        write(str.c_str(), str.c_str() + size);
+    }
+
+    inline ssize_t output_to_fd(int fd) {
+        if (buf_.empty()) {
+            return 0;
+        }
+
+        ssize_t total_len = 0;
+
+        for (;;) {
+            ssize_t len;
+            if (buf_.size() == 1) {
+                if (rpos_ == wpos_) {
+                    break;
+                }
+                len = ::write(fd, buf_.front().get() + rpos_, wpos_ - rpos_);
+            } else {
+                len = ::write(fd, buf_.front().get() + rpos_, block_size_ - rpos_);
+            }
+            if (len < 0) {
+                if (total_len == 0) {
+                    return len;
+                } else {
+                    break;
+                }
+            } else if (len == 0) {
+                break;
+            }
+            rpos_ += len;
+            total_len += len;
+
+            if (rpos_ == block_size_) {
+                // TODO: May want to actually free the memory
+                free_list_.push_back(std::move(buf_.front()));
+                buf_.pop();
+                rpos_ = 0;
+
+                if (buf_.empty()) {
+                    break;
+                }
+            }
+        }
+
+        return total_len;
+    }
+
+    inline bool empty() const {
+        return buf_.empty() || (buf_.size() == 1 && rpos_ == wpos_);
+    }
+
+ private:
+    size_t block_size_;
+    std::queue<std::unique_ptr<char[]>> buf_;
+    std::vector<std::unique_ptr<char[]>> free_list_;
     size_t wpos_, rpos_;
 };
 
 using UsernameFd = std::unordered_map<std::string, int>;
 using FdUsername = std::unordered_map<int, std::string>;
 using FdBuffer = std::unordered_map<int, Buffer>;
+using FdBlockBuffer = std::unordered_map<int, BlockBuffer>;
 
 bool handle_read_common(int clientfd, Buffer* buf);
 
